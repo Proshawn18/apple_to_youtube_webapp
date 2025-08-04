@@ -176,7 +176,7 @@ def process_playlist():
     errors = []
     for track_query in tracks:
         try:
-            search_request = Youtube().list(
+            search_request = youtube().list(
                 part="snippet", q=track_query, type="video", maxResults=1
             )
             search_response = search_request.execute()
