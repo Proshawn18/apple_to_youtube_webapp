@@ -7,6 +7,7 @@ import googleapiclient.discovery
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, redirect, render_template, request, session, url_for
+# REQUIRED CHANGE: Added the import for the Credentials object
 from google.oauth2.credentials import Credentials
 
 # --- Flask App Configuration ---
@@ -14,7 +15,8 @@ app = Flask(__name__)
 # The SECRET_KEY is used to sign the session cookie.
 # In production, set this as an environment variable for security.
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "super-secret-key-for-dev")
-# Allows OAuth to run on http:// for local testing. Remove in production if you have HTTPS.
+# This allows OAuth to run on http:// for local testing.
+# This is safe in Cloud Run because Google's proxy handles the TLS termination.
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 # --- Google API Configuration ---
@@ -91,23 +93,18 @@ def index():
 
 @app.route('/migrate', methods=['POST'])
 def migrate():
-    """
-    Initiates the migration process by starting the OAuth flow.
-    The Apple Music URL is stored in the session to be used after authorization.
-    """
+    """Initiates the migration process by starting the OAuth flow."""
     apple_music_url = request.form.get('apple_music_url')
     if not apple_music_url:
         return "Please provide an Apple Music playlist URL.", 400
 
     session['apple_music_url'] = apple_music_url
 
-    # Load config from environment variable instead of a file
     client_config = get_client_config()
     flow = google_auth_oauthlib.flow.Flow.from_client_config(
         client_config, scopes=SCOPES
     )
 
-    # The redirect_uri must match one of the "Authorized redirect URIs" in your Google Cloud credential.
     flow.redirect_uri = url_for('oauth2callback', _external=True)
 
     authorization_url, state = flow.authorization_url(
@@ -120,12 +117,9 @@ def migrate():
 
 @app.route('/oauth2callback')
 def oauth2callback():
-    """
-    Callback route for Google OAuth. It exchanges the authorization code for credentials.
-    """
+    """Callback route for Google OAuth. Exchanges the authorization code for credentials."""
     state = session['state']
     
-    # Load config from environment variable
     client_config = get_client_config()
     flow = google_auth_oauthlib.flow.Flow.from_client_config(
         client_config, scopes=SCOPES, state=state
@@ -135,7 +129,6 @@ def oauth2callback():
     authorization_response = request.url
     flow.fetch_token(authorization_response=authorization_response)
 
-    # Store credentials in the session as a JSON string
     credentials = flow.credentials
     session['credentials'] = credentials_to_dict(credentials)
 
@@ -144,13 +137,11 @@ def oauth2callback():
 
 @app.route('/process')
 def process_playlist():
-    """
-    The core logic: scrapes tracks, creates a YouTube playlist, and adds videos.
-    """
+    """The core logic: scrapes tracks, creates a YouTube playlist, and adds videos."""
     if 'credentials' not in session or 'apple_music_url' not in session:
         return redirect(url_for('index'))
 
-    # Rebuild credentials from session data
+    # REQUIRED CHANGE: Use the imported Credentials class
     credentials = Credentials(**session['credentials'])
     youtube = googleapiclient.discovery.build(
         API_SERVICE_NAME, API_VERSION, credentials=credentials
@@ -158,12 +149,10 @@ def process_playlist():
 
     apple_music_url = session.pop('apple_music_url', None)
 
-    # 1. Scrape Apple Music Playlist
     playlist_name, tracks = scrape_apple_music_playlist(apple_music_url)
     if not tracks:
         return render_template('results.html', error=playlist_name or "Could not scrape playlist.")
 
-    # 2. Create a new YouTube Playlist
     try:
         playlist_title = f"{playlist_name} (Migrated from Apple Music)"
         playlist_request = youtube.playlists().insert(
@@ -178,16 +167,16 @@ def process_playlist():
         )
         playlist_response = playlist_request.execute()
         playlist_id = playlist_response["id"]
+        # REQUIRED CHANGE: Use the correct, standard YouTube URL format
         playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
     except googleapiclient.errors.HttpError as e:
         return render_template('results.html', error=f"Could not create YouTube playlist: {e}")
 
-    # 3. Search for each track and add it to the new playlist
     migrated_count = 0
     errors = []
     for track_query in tracks:
         try:
-            search_request = youtube().list(
+            search_request = Youtube().list(
                 part="snippet", q=track_query, type="video", maxResults=1
             )
             search_response = search_request.execute()
