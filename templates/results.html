@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Migration Complete</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; border: 1px solid #ccc; border-radius: 10px; }
+        .success { color: green; }
+        .error { color: red; }
+        a { color: #0066cc; }
+    </style>
+</head>
+<body>
+    <h1>Migration Results</h1>
+    
+    {% if error %}
+        <p class="error">An error occurred: {{ error }}</p>
+        <a href="/">Try again</a>
+    {% else %}
+        <p class="success">
+            Successfully migrated <strong>{{ migrated_count }}</strong> out of <strong>{{ total_songs }}</strong> songs.
+        </p>
+        <p>
+            You can view your new playlist here:
+            <a href="{{ playlist_url }}" target="_blank">{{ playlist_url }}</a>
+        </p>
+    {% endif %}
+
+    {% if errors %}
+        <h2>Errors Encountered:</h2>
+        <ul>
+            {% for e in errors %}
+                <li>{{ e }}</li>
+            {% endfor %}
+        </ul>
+    {% endif %}
+</body>
+</html>
