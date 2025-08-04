@@ -7,7 +7,6 @@ import googleapiclient.discovery
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, redirect, render_template, request, session, url_for
-# REQUIRED CHANGE: Added the import for the Credentials object
 from google.oauth2.credentials import Credentials
 
 # --- Flask App Configuration ---
@@ -141,7 +140,6 @@ def process_playlist():
     if 'credentials' not in session or 'apple_music_url' not in session:
         return redirect(url_for('index'))
 
-    # REQUIRED CHANGE: Use the imported Credentials class
     credentials = Credentials(**session['credentials'])
     youtube = googleapiclient.discovery.build(
         API_SERVICE_NAME, API_VERSION, credentials=credentials
@@ -167,7 +165,6 @@ def process_playlist():
         )
         playlist_response = playlist_request.execute()
         playlist_id = playlist_response["id"]
-        # REQUIRED CHANGE: Use the correct, standard YouTube URL format
         playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
     except googleapiclient.errors.HttpError as e:
         return render_template('results.html', error=f"Could not create YouTube playlist: {e}")
@@ -176,7 +173,7 @@ def process_playlist():
     errors = []
     for track_query in tracks:
         try:
-            search_request = youtube.list(
+            search_request = Youtube().list(
                 part="snippet", q=track_query, type="video", maxResults=1
             )
             search_response = search_request.execute()
