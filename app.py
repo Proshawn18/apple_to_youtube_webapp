@@ -1,21 +1,18 @@
 import os
 import json
 import uuid
-
-import google_auth_oauthlib.flow
-import googleapiclient.discovery
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, redirect, render_template, request, session, url_for
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # --- Flask App Configuration ---
 app = Flask(__name__)
-# The SECRET_KEY is used to sign the session cookie.
-# In production, set this as an environment variable for security.
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "super-secret-key-for-dev")
-# This allows OAuth to run on http:// for local testing.
-# This is safe in Cloud Run because Google's proxy handles the TLS termination.
+# Allow OAuth on http://localhost for testing
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
 # --- Google API Configuration ---
@@ -23,188 +20,174 @@ SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
 API_SERVICE_NAME = "youtube"
 API_VERSION = "v3"
 
-
 # --- Helper Functions ---
 
 def get_client_config():
-    """Loads client config from the GOOGLE_CLIENT_SECRET_JSON environment variable."""
+    """Load client config JSON from an environment variable."""
     config_str = os.environ.get("GOOGLE_CLIENT_SECRET_JSON")
     if not config_str:
-        raise ValueError("Missing GOOGLE_CLIENT_SECRET_JSON environment variable. Please set it to the content of your client_secret.json file.")
+        raise ValueError(
+            "Missing GOOGLE_CLIENT_SECRET_JSON; set it to your client_secret.json contents."
+        )
     return json.loads(config_str)
 
-def scrape_apple_music_playlist(url):
-    """Fetches an Apple Music playlist and scrapes track titles and artists."""
+def credentials_to_dict(creds: Credentials) -> dict:
+    """Serialize OAuth2 credentials to store in the Flask session."""
+    return {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+
+def scrape_apple_music_playlist(url: str):
+    """Fetch an Apple Music playlist and extract track titles + artists."""
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        )
     }
     try:
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
+        resp = requests.get(url, headers=headers)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
 
-        script_tag = soup.find('script', id='serialized-server-data')
-        if not script_tag:
-            return None, "Could not find playlist data on the page."
+        # look for the serialized data script (may change over time)
+        script = soup.find("script", id="serialized-server-data") or soup.find("script", {"type": "application/json"})
+        if not script or not script.string:
+            return None, "Could not locate embedded playlist data."
 
-        data = json.loads(script_tag.string)
-        playlist_name = data[0]['data']['name']
+        data = json.loads(script.string)
+        # adjust navigation to actual JSON shape if needed
+        playlist_info = data[0]["data"]
+        playlist_name = playlist_info.get("name", "Apple Music Playlist")
+        items = []
+        for section in playlist_info.get("sections", []):
+            if section.get("itemKind") == "trackLockup":
+                items.extend(section.get("items", []))
 
-        track_list_items = []
-        for section in data[0]['data']['sections']:
-            if section.get('itemKind') == 'trackLockup':
-                track_list_items.extend(section.get('items', []))
-
-        tracks = []
-        for track in track_list_items:
-            title = track.get('title', 'Unknown Title')
-            artist = track.get('artistName', 'Unknown Artist')
-            tracks.append(f"{title} by {artist}")
-
+        tracks = [
+            f"{t.get('title','Unknown Title')} by {t.get('artistName','Unknown Artist')}"
+            for t in items
+        ]
         return playlist_name, tracks
-    except requests.exceptions.RequestException as e:
-        return None, f"Network error fetching Apple Music URL: {e}"
-    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as e:
-        return None, f"Error parsing playlist data: {e}"
-    except Exception as e:
-        return None, f"An unknown error occurred during scraping: {e}"
 
-
-def credentials_to_dict(credentials):
-    """Helper function to serialize credentials for the session."""
-    return {
-        'token': credentials.token,
-        'refresh_token': credentials.refresh_token,
-        'token_uri': credentials.token_uri,
-        'client_id': credentials.client_id,
-        'client_secret': credentials.client_secret,
-        'scopes': credentials.scopes
-    }
-
+    except requests.RequestException as e:
+        return None, f"Network error: {e}"
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        return None, f"Parsing error: {e}"
 
 # --- Flask Routes ---
 
-@app.route('/')
+@app.route("/")
 def index():
-    """Renders the main page with the input form."""
-    return render_template('index.html')
+    return render_template("index.html")
 
 
-@app.route('/migrate', methods=['POST'])
+@app.route("/migrate", methods=["POST"])
 def migrate():
-    """Initiates the migration process by starting the OAuth flow."""
-    apple_music_url = request.form.get('apple_music_url')
-    if not apple_music_url:
+    apple_url = request.form.get("apple_music_url")
+    if not apple_url:
         return "Please provide an Apple Music playlist URL.", 400
 
-    session['apple_music_url'] = apple_music_url
-
+    session["apple_music_url"] = apple_url
     client_config = get_client_config()
-    flow = google_auth_oauthlib.flow.Flow.from_client_config(
-        client_config, scopes=SCOPES
+    flow = Flow.from_client_config(client_config, SCOPES)
+    flow.redirect_uri = url_for("oauth2callback", _external=True)
+
+    auth_url, state = flow.authorization_url(
+        access_type="offline", include_granted_scopes="true"
     )
-
-    flow.redirect_uri = url_for('oauth2callback', _external=True)
-
-    authorization_url, state = flow.authorization_url(
-        access_type='offline', include_granted_scopes='true'
-    )
-    session['state'] = state
-
-    return redirect(authorization_url)
+    session["state"] = state
+    return redirect(auth_url)
 
 
-@app.route('/oauth2callback')
+@app.route("/oauth2callback")
 def oauth2callback():
-    """Callback route for Google OAuth. Exchanges the authorization code for credentials."""
-    state = session['state']
-    
+    state = session.get("state")
+    if not state:
+        return redirect(url_for("index"))
+
     client_config = get_client_config()
-    flow = google_auth_oauthlib.flow.Flow.from_client_config(
-        client_config, scopes=SCOPES, state=state
-    )
-    flow.redirect_uri = url_for('oauth2callback', _external=True)
+    flow = Flow.from_client_config(client_config, SCOPES, state=state)
+    flow.redirect_uri = url_for("oauth2callback", _external=True)
 
-    authorization_response = request.url
-    flow.fetch_token(authorization_response=authorization_response)
-
-    credentials = flow.credentials
-    session['credentials'] = credentials_to_dict(credentials)
-
-    return redirect(url_for('process_playlist'))
+    flow.fetch_token(authorization_response=request.url)
+    creds = flow.credentials
+    session["credentials"] = credentials_to_dict(creds)
+    return redirect(url_for("process_playlist"))
 
 
-@app.route('/process')
+@app.route("/process")
 def process_playlist():
-    """The core logic: scrapes tracks, creates a YouTube playlist, and adds videos."""
-    if 'credentials' not in session or 'apple_music_url' not in session:
-        return redirect(url_for('index'))
+    if "credentials" not in session or "apple_music_url" not in session:
+        return redirect(url_for("index"))
 
-    credentials = Credentials(**session['credentials'])
-    youtube = googleapiclient.discovery.build(
-        API_SERVICE_NAME, API_VERSION, credentials=credentials
-    )
+    # reconstruct credentials
+    creds = Credentials(**session["credentials"])
+    # refresh if expired
+    if creds.expired and creds.refresh_token:
+        creds.refresh(requests.Request())
+        session["credentials"] = credentials_to_dict(creds)
 
-    apple_music_url = session.pop('apple_music_url', None)
+    youtube = build(API_SERVICE_NAME, API_VERSION, credentials=creds)
+    apple_url = session.pop("apple_music_url", None)
+    playlist_name, tracks_or_error = scrape_apple_music_playlist(apple_url)
 
-    playlist_name, tracks = scrape_apple_music_playlist(apple_music_url)
-    if not tracks:
-        return render_template('results.html', error=playlist_name or "Could not scrape playlist.")
-
-    try:
-        playlist_title = f"{playlist_name} (Migrated from Apple Music)"
-        playlist_request = youtube.playlists().insert(
-            part="snippet,status",
-            body={
-                "snippet": {
-                    "title": playlist_title,
-                    "description": f"Playlist migrated from {apple_music_url}"
-                },
-                "status": {"privacyStatus": "private"}
-            }
+    if not playlist_name or not isinstance(tracks_or_error, list):
+        return render_template(
+            "results.html", error=tracks_or_error or "Failed to scrape playlist."
         )
-        playlist_response = playlist_request.execute()
-        playlist_id = playlist_response["id"]
+
+    tracks = tracks_or_error
+    try:
+        # create the YouTube playlist
+        body = {
+            "snippet": {
+                "title": f"{playlist_name} (migrated)",
+                "description": f"Migrated from Apple Music: {apple_url}"
+            },
+            "status": {"privacyStatus": "private"}
+        }
+        playlist_resp = youtube.playlists().insert(part="snippet,status", body=body).execute()
+        playlist_id = playlist_resp["id"]
         playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
-    except googleapiclient.errors.HttpError as e:
-        return render_template('results.html', error=f"Could not create YouTube playlist: {e}")
+    except HttpError as e:
+        return render_template("results.html", error=f"Playlist creation error: {e}")
 
-    migrated_count = 0
-    errors = []
-    for track_query in tracks:
+    migrated, errors = 0, []
+    for q in tracks:
         try:
-            search_request = Youtube().list(
-                part="snippet", q=track_query, type="video", maxResults=1
-            )
-            search_response = search_request.execute()
+            search_resp = youtube.search().list(
+                part="snippet", q=q, type="video", maxResults=1
+            ).execute()
 
-            if search_response["items"]:
-                video_id = search_response["items"][0]["id"]["videoId"]
-
+            items = search_resp.get("items", [])
+            if items:
+                vid = items[0]["id"]["videoId"]
                 youtube.playlistItems().insert(
                     part="snippet",
                     body={
-                        "snippet": {
-                            "playlistId": playlist_id,
-                            "resourceId": {"kind": "youtube#video", "videoId": video_id}
-                        }
+                        "snippet": {"playlistId": playlist_id,
+                                    "resourceId": {"kind": "youtube#video", "videoId": vid}}
                     }
                 ).execute()
-                migrated_count += 1
-        except googleapiclient.errors.HttpError as e:
-            errors.append(f"Could not add '{track_query}': {e}")
+                migrated += 1
+        except HttpError as e:
+            errors.append(f"Failed to add '{q}': {e}")
 
     return render_template(
-        'results.html',
+        "results.html",
         playlist_url=playlist_url,
         total_songs=len(tracks),
-        migrated_count=migrated_count,
-        errors=errors
+        migrated_count=migrated,
+        errors=errors,
     )
 
 
-if __name__ == '__main__':
-    # For local development, this will run on port 8080.
-    # For Cloud Run, the PORT environment variable is used.
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=True)
