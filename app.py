@@ -8,6 +8,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from googleapiclient.http import BatchHttpRequest
 
 # --- Flask App Configuration ---
 app = Flask(__name__)
@@ -79,6 +80,13 @@ def scrape_apple_music_playlist(url: str):
         return None, f"Network error: {e}"
     except (ValueError, KeyError, IndexError, TypeError) as e:
         return None, f"Parsing error: {e}"
+    
+def callback(request_id, response, exception):
+    if exception:
+        print(f"Error for request {request_id}: {exception}")
+    else:
+        print(f"Response for request {request_id}: {response}")
+
 
 # --- Flask Routes ---
 
@@ -158,7 +166,7 @@ def process_playlist():
     except HttpError as e:
         return render_template("results.html", error=f"Playlist creation error: {e}")
 
-    migrated, errors = 0, []
+    """migrated, errors = 0, []
     for q in tracks:
         try:
             search_resp = youtube.search().list(
@@ -177,14 +185,45 @@ def process_playlist():
                 ).execute()
                 migrated += 1
         except HttpError as e:
-            errors.append(f"Failed to add '{q}': {e}")
+            errors.append(f"Failed to add '{q}': {e}")"""
+    
+    tracks_to_add = []
+    for q in tracks:
+        search_resp = youtube.search().list(
+            part="snippet", q=q, type="video", maxResults=1
+        ).execute()
+
+        items = search_resp.get("items", [])
+        if items:
+            tracks_to_add.append(items[0]["id"]["videoId"])
+
+    batch = youtube.new_batch_http_request()
+    for track in tracks_to_add:
+        index += 1
+        batch.add(
+            youtube.playlistItems().insert(
+                    part="snippet",
+                    body={
+                        "snippet": {"playlistId": playlist_id,
+                                    "resourceId": {"kind": "youtube#video", "videoId": track}}
+                    }
+                ),
+            callback=callback,
+            request_id="track"+str(index)
+        )
+
+    batch.execute()
+
+
+
+
 
     return render_template(
         "results.html",
         playlist_url=playlist_url,
         total_songs=len(tracks),
-        migrated_count=migrated,
-        errors=errors,
+        migrated_count=0, #migrated_count=migrated,
+        errors=0 #errors=errors,
     )
 
 
